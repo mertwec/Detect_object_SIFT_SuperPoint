@@ -2,70 +2,41 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Overview
-
-Instance-level object detection comparing two approaches:
-1. **SIFT** — classical CV: RootSIFT + FLANN + RANSAC homography
-2. **SuperPoint+LightGlue** — deep learning: learned features + matcher + RANSAC
-
-## Running the Pipeline
+## Commands
 
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
+# Install dependencies (LightGlue installs from GitHub)
+pip install -r requirements.txt
 
-# SIFT method
-python cli.py --ref data_example/ref.jpg --scenes data_example/ --output output/ --method sift
+# Run SIFT pipeline (CPU-friendly)
+python cli.py sift data_example/ --output output/ --ratio 0.80 --min-matches 6
 
-# SuperPoint method
-python cli.py --ref data_example/ref.jpg --scenes data_example/ --output output_SP/ --method superpoint --max-keypoints 4096
+# Run SuperPoint+LightGlue pipeline (GPU recommended)
+python cli.py superpoint data_example/ --output output_SP/ --max-keypoints 2048 --min-matches 6
+
+# Single image detection (pass specific scene path)
+python cli.py sift data_example/ --output output/
 ```
-
-**CLI arguments:**
-- `--ref`: reference image path (required)
-- `--scenes`: image or directory path (required; expects `ref/` + `scenes/` subdirs when directory)
-- `--output`: output directory (default: `./output`)
-- `--method`: `sift` or `superpoint` (default: `sift`)
-- `--ratio`: Lowe's ratio test threshold, SIFT only (default: 0.80)
-- `--min-matches`: minimum matches for homography (default: 6)
-- `--max-keypoints`: max keypoints, SuperPoint only (default: 2048)
 
 ## Architecture
 
-```
-cli.py                      # Click CLI entry point
-detector/
-  __init__.py               # Re-exports detect, detect_batch, detect_sp, detect_batch_sp
-  pipeline.py               # SIFT pipeline: multi-scale extraction, batch support
-  pipeline_sp.py            # SuperPoint pipeline: single-scale, batch support
-  features.py               # SIFT extraction + RootSIFT normalization
-  matching.py               # FLANN KD-tree matcher + Lowe's ratio test
-  superpoint.py             # SuperPointMatcher class wrapping SuperPoint + LightGlue
-  geometry.py               # Shared RANSAC verification, bbox computation, visualization
-  utils/timer.py            # banchmark_time() timing decorator
-```
+Instance-level object detection: given a reference image, find and localize the object in scene images. Two independent pipelines share geometry logic.
 
-### Data Flow
+**Data layout expected by CLI**: `<data_dir>/ref/ref.jpg` and `<data_dir>/scenes/*.jpg`
 
-Both pipelines follow the same pattern:
-1. Extract features from reference and scene images
-2. Match descriptors (FLANN ratio test for SIFT; LightGlue for SuperPoint)
-3. Geometric verification via RANSAC homography (`geometry._find_object_core()`)
-4. Compute bounding box (homography projection if ≥15 inliers, else `minAreaRect`)
-5. Return `DetectionResult` (found, confidence, bbox, homography, num_inliers, num_matches)
+### Module responsibilities
 
-### Key Design Decisions
+- `detector/features.py` — SIFT extraction with RootSIFT normalization (L1 normalize → sqrt). Returns `Features` dataclass (keypoints, 128-dim descriptors, image_shape).
+- `detector/matching.py` — FLANN KD-tree matching with Lowe's ratio test. Returns `cv2.DMatch` list.
+- `detector/geometry.py` — Shared geometric verification for both pipelines. `find_object()` (SIFT API) and `find_object_from_points()` (SuperPoint API) both call `_find_object_core()` which runs RANSAC homography, computes inlier ratio, and determines the bounding box. Detection threshold: ≥5 inliers AND inlier_ratio ≥ 0.15. Bbox uses homography projection if ≥15 inliers, else falls back to `minAreaRect` of inlier points. Rejects bbox if it covers >50% of scene area.
+- `detector/pipeline.py` — SIFT pipeline. Extracts reference features at 3 scales (`REF_SCALES = [0.25, 0.5, 1.0]`), picks best result (most inliers) per scene.
+- `detector/superpoint.py` — `SuperPointMatcher` class wrapping SuperPoint + LightGlue. Pre-extracts reference features once; auto-selects CUDA if available.
+- `detector/pipeline_sp.py` — SuperPoint pipeline. Reuses reference features across all scenes in batch mode.
+- `cli.py` — Click CLI with two subcommands: `sift` and `superpoint`. Calls `detect_batch` / `detect_batch_sp` and prints a summary table.
 
-- **Multi-scale SIFT**: reference processed at 3 scales (0.25×, 0.5×, 1.0×); best inlier count wins
-- **RootSIFT**: L1-norm + sqrt applied before FLANN matching for better Hellinger distance
-- **Detection threshold**: ≥5 inliers AND inlier_ratio ≥ 0.15 AND bbox < 50% of scene area
-- **SuperPoint**: GPU auto-detection (CUDA if available, else CPU); no multi-scale needed
+### Key design notes
 
-## Dependencies
-
-Install into virtualenv:
-```bash
-pip install -r requirements.txt
-```
-
-Key packages: `opencv-python`, `numpy`, `torch`, `torchvision`, `click`, `lightglue` (from GitHub).
+- Both pipelines converge at `geometry.py` — changes to detection thresholds or bbox logic affect both methods.
+- `SuperPointMatcher.extract_features()` returns cacheable feature dicts; `detect_batch_sp` exploits this by extracting reference features once.
+- `banchmark_time` decorator in `utils/timer.py` (note: typo in name) prints wall-clock time for any wrapped function.
+- LightGlue is installed from GitHub source (`git+https://github.com/cvg/LightGlue.git`), not PyPI.
